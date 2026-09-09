@@ -1,249 +1,330 @@
-# Password Profile
+# password_profile
 
-Enterprise‑grade password policy and authentication hardening for PostgreSQL.  
-Built with Rust + pgrx (v0.16.1). Tested on PostgreSQL 16-18.
+`password_profile` is a PostgreSQL extension for password policy, password history, password expiry
+and brute-force protection.
 
-## 1. Why This Extension?
+It provides:
 
-- Enforces strong password rules (length, complexity, blacklist, username checks).
-- Blocks hash‑bypass attempts (`md5...`, bcrypt, SCRAM, argon2, etc.).
-- Tracks failed logins in real time, locks accounts after N attempts, and clears counters on success.
-- Includes password history, expiry, and grace login support.
-- Ships with a background worker, shared‑memory lock cache, and auth ring buffer to avoid nested SPI or crash scenarios.
-- Designed for production: no logging of usernames/passwords, no SPI calls during `_PG_init`, and parametrised SQL everywhere.
+- password complexity checks for `CREATE ROLE` and `ALTER ROLE`;
+- password history and reuse-period checks;
+- a password blacklist;
+- password expiry with grace logins;
+- failed-login counting and temporary account lockout;
+- shared-memory login checks backed by a background worker and a durable event journal.
 
-## 2. Architecture Overview
+## Support
 
-| Component | Purpose |
-|-----------|---------|
-| `client_auth_hook` (C shim) | Hooks PostgreSQL authentication, inspects SQLSTATE, enqueues auth events without nested SPI. |
-| Auth Event Ring (shared memory) | Lock‑free producer/consumer queue between backend and worker. |
-| Background Worker (`auth_event_consumer`) | Runs SPI transactions to update tables, apply lockouts, and sync shared cache. |
-| Lock Cache (shared memory) | O(1) lookups for hot lockout decisions; mirrors DB state with LRU eviction. |
-| Blacklist Cache | SipHash13 over bundled/common passwords; binary search for constant latency. |
-| SQL API | Functions for password checks, lock management, stats, and history. |
+| Item | Value |
+|---|---|
+| Extension version | 1.0.0 |
+| pgrx | 0.16.1 |
+| Runtime-tested platform | PostgreSQL 17.11, Rocky Linux 9, x86-64 |
+| Build targets | PostgreSQL 13–18 |
+| Control database | `postgres` |
 
-The extension is transparent to applications. Regular logins go through PostgreSQL as usual; policy checks and lock decisions happen behind the scenes.
+Only PostgreSQL 17 has completed runtime, restart, load and standby testing. PostgreSQL 13–16 and
+18 are build targets but require their own runtime validation before production use.
 
-## 3. Requirements
+The extension must be installed in the `postgres` database and listed in
+`shared_preload_libraries`. Password changes must be performed while connected to `postgres`.
 
-### PostgreSQL
+## Installation: Rocky Linux 9 and PostgreSQL 17
 
-**Supported versions:**
-- PostgreSQL 16, 17, or 18
-
-**Required packages:**
-- `postgresqlXX`
-- `postgresqlXX-server`
-- `postgresqlXX-devel`
-
-*The `-devel` package is mandatory for extension compilation.*
-
----
-
-### Rust Toolchain
-
-- Rust ≥ 1.70
-- `cargo-pgrx 0.16.1`
-
-Install if needed:
+### Packages
 
 ```bash
-cargo install --locked cargo-pgrx --version 0.16.1
-```
-
----
-
-### PostgreSQL Configuration Capability
-
-You must be able to modify:
-- `shared_preload_libraries`
-
-and restart PostgreSQL.
-
----
-
-### System Dependencies (Build-Time)
-
-For RHEL / Rocky / AlmaLinux systems:
-
-```bash
+sudo dnf install -y dnf-plugins-core epel-release
 sudo dnf config-manager --set-enabled crb
 
 sudo dnf install -y \
-    openssl-devel \
-    krb5-devel \
-    pkgconf-pkg-config
+  https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+
+sudo dnf -qy module disable postgresql
+
+sudo dnf install -y \
+  postgresql17 postgresql17-server postgresql17-devel postgresql17-contrib \
+  curl git clang openssl-devel krb5-devel policycoreutils pkgconf-pkg-config
+
+sudo dnf group install -y "Development Tools"
 ```
 
-These libraries are required by:
-- Rust `openssl-sys`
-- PostgreSQL server headers
-- Authentication/GSSAPI includes
-
----
-
-### Environment Setup
-
-Ensure `pg_config` is discoverable by build tooling:
+Initialize PostgreSQL only on a new server:
 
 ```bash
-export PG_CONFIG=/usr/pgsql-XX/bin/pg_config
+sudo /usr/pgsql-17/bin/postgresql-17-setup initdb
+sudo systemctl enable --now postgresql-17
 ```
 
-*Alternatively pass it explicitly to `cargo pgrx`.*
+Do not run `initdb` against an existing cluster.
 
----
+### Rust and pgrx
 
-## 4. Build & Install
-
-### Initialise pgrx
+Run as the non-root build user:
 
 ```bash
-cargo pgrx init --pg16 /usr/pgsql-16/bin/pg_config
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+cargo install --locked cargo-pgrx --version 0.16.1
+cargo pgrx init --pg17 /usr/pgsql-17/bin/pg_config
 ```
 
-*Run once per PostgreSQL version.*
-
-### Build Extension Package
+### Build and install
 
 ```bash
-cargo pgrx package --pg-config /usr/pgsql-16/bin/pg_config
+git clone https://github.com/bisoftbilgi/PG-Password-Profile.git
+cd PG-Password-Profile
+
+export PG_CONFIG=/usr/pgsql-17/bin/pg_config
+cargo pgrx package \
+  --pg-config "$PG_CONFIG" \
+  --no-default-features \
+  --features pg17
 ```
 
-### Install Artifacts into PostgreSQL
-
-This installs:
-- Shared library (`.so`)
-- Extension control file
-- SQL migration scripts
+Install the generated files:
 
 ```bash
-sudo cp -r target/release/password_profile-pg16/usr/pgsql-16/* /usr/pgsql-16/
+sudo install -o root -g root -m 0755 \
+  target/release/password_profile-pg17/usr/pgsql-17/lib/password_profile.so \
+  /usr/pgsql-17/lib/password_profile.so
+
+sudo install -o root -g root -m 0644 \
+  target/release/password_profile-pg17/usr/pgsql-17/share/extension/password_profile.control \
+  /usr/pgsql-17/share/extension/password_profile.control
+
+sudo install -o root -g root -m 0644 \
+  target/release/password_profile-pg17/usr/pgsql-17/share/extension/password_profile--1.0.0.sql \
+  /usr/pgsql-17/share/extension/password_profile--1.0.0.sql
+
+sudo restorecon -v \
+  /usr/pgsql-17/lib/password_profile.so \
+  /usr/pgsql-17/share/extension/password_profile.control \
+  /usr/pgsql-17/share/extension/password_profile--1.0.0.sql
 ```
 
-### Install Password Blacklist
+Do not use `cp -a` from the build directory. It can preserve the build user's ownership and
+`user_home_t` SELinux label.
+
+Install the supplied blacklist:
 
 ```bash
-sudo cp blacklist.txt /var/lib/pgsql/16/data/password_profile_blacklist.txt
-sudo chown postgres:postgres /var/lib/pgsql/16/data/password_profile_blacklist.txt
+sudo install -o postgres -g postgres -m 0600 \
+  blacklist.txt \
+  /var/lib/pgsql/17/data/password_profile_blacklist.txt
 ```
 
-### Enable Extension Preload
+### Configure PostgreSQL
+
+Preserve any existing entries in `shared_preload_libraries`. During initial installation, keep the
+two login-time features disabled:
+
+```conf
+shared_preload_libraries = 'password_profile'
+password_profile.lockout_enforcement = off
+password_profile.expiry_enforcement = off
+```
+
+Restart and create the extension:
 
 ```bash
-echo "shared_preload_libraries = 'password_profile'" \
-| sudo tee -a /var/lib/pgsql/16/data/postgresql.conf
+sudo systemctl restart postgresql-17
 
-# Enable in postgresql.conf
-echo \"shared_preload_libraries = 'password_profile_pure'\" | sudo tee -a /var/lib/pgsql/16/data/postgresql.conf
-sudo systemctl restart postgresql-16
+sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE EXTENSION password_profile;"
+
+sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 \
+  -c "SELECT password_profile.load_blacklist_from_file('/var/lib/pgsql/17/data/password_profile_blacklist.txt');"
 ```
 
-# Create in each database where you need it
-psql -d mydb -c \"CREATE EXTENSION password_profile_pure;\"
-psql -d mydb -c \"SELECT init_login_attempts_table();\"
+Enable the features and reload:
 
-### Load Common Password Blacklist
+```conf
+password_profile.lockout_enforcement = on
+password_profile.expiry_enforcement = on
+```
 
 ```bash
-psql -d mydb -c "SELECT load_blacklist_from_file(NULL);"
+sudo systemctl reload postgresql-17
 ```
 
-### Multi-Version Build
-
-To build for additional PostgreSQL versions:
-
-```bash
-cargo pgrx package --pg-config /usr/pgsql-15/bin/pg_config
-cargo pgrx package --pg-config /usr/pgsql-14/bin/pg_config
-```
-
----
-
-## 5. Configuration (GUCs)
-
-All GUCs live under `password_profile.*`. They can be set globally (`postgresql.conf`, `ALTER SYSTEM`) or per role/database (`ALTER ROLE ... SET`).
-
-| GUC | Default | Description |
-|-----|---------|-------------|
-| `min_length` | 8 | Minimum password length. |
-| `require_uppercase` / `require_lowercase` / `require_digit` / `require_special` | false | Enable specific complexity rules. |
-| `prevent_username` | true | Reject passwords containing the username (case‑insensitive). |
-| `password_history_count` | 5 | Number of historical passwords to remember (0 disables). |
-| `password_reuse_days` | 90 | Minimum days before reuse (0 disables). |
-| `password_expiry_days` | 90 | Force change after N days (0 disables). |
-| `password_grace_logins` | 3 | Allowed logins after expiry. |
-| `failed_login_max` | 3 | Failed attempts before lockout. |
-| `lockout_minutes` | 2 | Lock duration. |
-| `bcrypt_cost` | 10 | BCrypt cost (4–31). |
-| `bypass_password_profile` | false | Per‑role bypass flag (use `ALTER ROLE ... SET`). |
-
-Changes take effect immediately; no restart is required after shared_preload_libraries is set.
-
-## 6. SQL API Cheatsheet
-
-| Function | Description |
-|----------|-------------|
-| `check_password(username, password)` | Validates password during CREATE/ALTER ROLE or manually (returns informative text). |
-| `record_password_change(username, password)` | Stores bcrypt hash and updates expiry metadata. |
-| `record_failed_login(username)` | Increments counters, applies lockout if needed (used by worker). |
-| `clear_login_attempts(username)` | Superuser/user resets lock counters. |
-| `is_user_locked(username)` | Boolean lock status. |
-| `check_user_access(username)` | Returns error message if locked; otherwise “Access granted”. |
-| `check_password_expiry(username)` | Indicates expiry/grace status. |
-| `add_to_blacklist(password[, reason])`, `remove_from_blacklist(password)` | Manage dynamic blacklist entries. |
-| `load_blacklist_from_file([file_path])` | Load common passwords from file (default: PGDATA/password_profile_blacklist.txt). |
-| `get_password_stats(username)` | Aggregated history/expiry/fail info. |
-| `get_lock_cache_stats()` | Shared cache metrics for monitoring. |
-
-Tables created under `password_profile.*` keep login attempts, password history, expiry data, and admin‑managed blacklist entries.
-
-## 7. Operations & Integration
-
-### Common Tasks
+Verify readiness:
 
 ```sql
--- Enable bypass for a maintenance account
-ALTER ROLE maint SET password_profile.bypass_password_profile = true;
-
--- Unlock a user
-SELECT clear_login_attempts('alice');
-
--- Audit recent failures
-SELECT username, fail_count, last_fail
-FROM password_profile.login_attempts
-ORDER BY last_fail DESC LIMIT 20;
+SELECT metric, value
+FROM password_profile.get_lock_cache_stats()
+WHERE metric IN ('worker_running', 'lock_cache_state', 'expiry_cache_state',
+                 'bypass_cache_state', 'auth_event_queue_state')
+ORDER BY metric;
 ```
 
-### Web UI / Control Plane Integration
+Expected values:
 
-Your management plane only needs to issue SQL and GUC commands:
+```text
+worker_running         = 1
+lock_cache_state       = 1
+expiry_cache_state     = 1
+bypass_cache_state     = 1
+auth_event_queue_state = 0
+```
 
-1. Toggle policies per role/database via `ALTER ROLE ... SET password_profile.*`.
-2. Expose admin actions (unlock user, set expiry) by calling the provided SQL functions.
-3. Display statistics by querying `password_profile.*` tables or `get_lock_cache_stats()`.
+A cache that is not ready pauses only the related extension feature; it does not reject valid
+PostgreSQL credentials. Check the PostgreSQL log if these values do not become ready.
 
-No additional APIs are required; everything routes through standard PostgreSQL connections.
+## Configuration
 
-## 8. Testing & Observability
+Settings are placed in `postgresql.conf`. Policy settings require a reload.
 
-- `cargo build` ensures the Rust layer compiles and macros are generated for IDEs.
-- `cargo pgrx test pg16` must run inside an environment where PostgreSQL can load the extension (shared_preload_libraries). In stripped CI containers the link step may fail because PG symbols are absent; run tests on a real PostgreSQL instance.
-- Monitoring queries:
-  ```sql
-  SELECT * FROM get_lock_cache_stats();
-  SELECT * FROM password_profile.login_attempts WHERE lockout_until > now();
-  SELECT dropped FROM password_profile.auth_event_ring; -- ring buffer health
-  ```
-- Logs include informative `password_profile:` lines; usernames are never printed.
+| Setting | Default | Meaning |
+|---|---:|---|
+| `password_profile.min_length` | 8 | Minimum password length |
+| `password_profile.require_uppercase` | off | Require an uppercase letter |
+| `password_profile.require_lowercase` | off | Require a lowercase letter |
+| `password_profile.require_digit` | off | Require a digit |
+| `password_profile.require_special` | off | Require a special character |
+| `password_profile.prevent_username` | on | Reject passwords containing the role name |
+| `password_profile.password_history_count` | 5 | Number of recent passwords checked |
+| `password_profile.password_reuse_days` | 90 | Minimum reuse period; `0` disables it |
+| `password_profile.password_expiry_days` | 90 | Password lifetime; `0` disables expiry |
+| `password_profile.password_grace_logins` | 3 | Logins allowed after expiry |
+| `password_profile.failed_login_max` | 3 | Failed attempts before lockout |
+| `password_profile.lockout_minutes` | 2 | Lockout duration |
+| `password_profile.bcrypt_cost` | 10 | bcrypt cost for history hashes |
+| `password_profile.lockout_enforcement` | on | Enable failed-login counting and lockout |
+| `password_profile.expiry_enforcement` | on | Enable login-time expiry checks |
 
-## 9. Troubleshooting
+Example:
 
-| Symptom | Check / Fix |
-|---------|-------------|
-| Extension fails to load | Ensure `.so` copied into server libdir and `shared_preload_libraries` contains `password_profile`. |
-| Background worker missing | `SELECT * FROM pg_stat_activity WHERE backend_type LIKE 'password_profile%';` and confirm shared_preload_libraries + restart. |
-| Auth events unprocessed | Inspect `dropped` counter in auth ring; if constantly rising, increase ring size and rebuild. |
-| Lock cache misses | `get_lock_cache_stats()` – if utilisation near 100%, bump `LOCK_CACHE_SIZE` constant and recompile. |
-| proc-macro errors in IDE | Run `cargo build` so `libpgrx_macros-*.so` exists in `target/debug/deps`. |
+```conf
+password_profile.min_length = 12
+password_profile.require_uppercase = on
+password_profile.require_lowercase = on
+password_profile.require_digit = on
+password_profile.require_special = on
+password_profile.failed_login_max = 3
+password_profile.lockout_minutes = 5
+```
+
+```bash
+sudo systemctl reload postgresql-17
+```
+
+## Usage
+
+Run password changes from the `postgres` database:
+
+```sql
+CREATE ROLE app_user LOGIN PASSWORD 'CorrectHorse!42';
+ALTER ROLE app_user PASSWORD 'AnotherStrong!43';
+```
+
+PostgreSQL always performs native authentication first. A wrong password is rejected normally. On a
+primary, failed attempts for an existing non-superuser role are counted and the role is temporarily
+locked after the configured threshold.
+
+Check and clear a lockout:
+
+```sql
+SELECT password_profile.is_user_locked('app_user');
+SELECT password_profile.clear_login_attempts('app_user');
+```
+
+Manage the blacklist:
+
+```sql
+SELECT password_profile.add_to_blacklist('ExampleBad!123', 'company policy');
+SELECT password_profile.remove_from_blacklist('ExampleBad!123');
+SELECT password_profile.load_blacklist_from_file('/absolute/path/blacklist.txt');
+```
+
+Exclude a maintenance role from password-profile rules:
+
+```sql
+ALTER ROLE maint SET password_profile.bypass_password_profile = true;
+ALTER ROLE maint RESET password_profile.bypass_password_profile;
+```
+
+The bypass change becomes visible to login checks in about one second. It does not bypass
+PostgreSQL's password authentication.
+
+## Monitoring
+
+```sql
+SELECT * FROM password_profile.get_lock_cache_stats();
+
+SELECT username, fail_count, last_fail, lockout_until
+FROM password_profile.login_attempts
+ORDER BY last_fail DESC;
+```
+
+Functions and tables are not granted to `PUBLIC`. A read-only monitoring role needs:
+
+```sql
+GRANT USAGE ON SCHEMA password_profile TO monitoring_role;
+GRANT SELECT ON TABLE password_profile.login_attempts TO monitoring_role;
+GRANT EXECUTE ON FUNCTION password_profile.get_lock_cache_stats() TO monitoring_role;
+GRANT EXECUTE ON FUNCTION password_profile.is_user_locked(text) TO monitoring_role;
+```
+
+Do not grant direct write access to extension tables. Use the management functions so shared caches
+remain consistent.
+
+## Standby behavior
+
+While PostgreSQL is in recovery:
+
+- native PostgreSQL authentication continues normally;
+- password complexity, history and blacklist rules still apply to password changes on the primary;
+- failed-login counting and account lockout are disabled on the standby;
+- password expiry and grace-login enforcement are disabled on the standby;
+- extension tables remain read-only replicas of the primary.
+
+After promotion, the worker starts, rebuilds its caches and enables protection when they are ready.
+
+## Failure behavior
+
+Authentication events are written to a durable journal before being accepted. If the RAM queue is
+full, additional events remain in the journal and are processed later. A restart does not discard
+accepted but uncommitted events.
+
+If the worker, journal or a cache is unhealthy, the affected extension protection pauses and emits
+a PostgreSQL warning. Native PostgreSQL authentication remains active, so an extension failure does
+not lock every user out of the database.
+
+Emergency switches:
+
+```conf
+password_profile.lockout_enforcement = off
+password_profile.expiry_enforcement = off
+```
+
+Reload PostgreSQL after changing them. A stopped background worker requires a PostgreSQL restart.
+
+## Important limitations
+
+- The control database is fixed as `postgres`.
+- Standby brute-force and expiry enforcement are intentionally disabled.
+- Runtime testing currently covers PostgreSQL 17 on Rocky Linux 9 only.
+- Login-time caches hold 2048 lock/expiry entries and 1024 bypass roles.
+- PostgreSQL may log password DDL when `log_statement` includes DDL or all statements. Protect server
+  logs and choose the logging policy accordingly.
+- Versioned extension upgrade scripts are not provided yet. Do not drop and recreate the extension
+  to deploy an update if its stored history or lockout data must be retained.
+
+## Development checks
+
+```bash
+cargo +1.88.0 fmt --check
+cargo +1.88.0 check --all-targets --no-default-features --features pg17
+cargo +1.88.0 pgrx package \
+  --pg-config /usr/pgsql-17/bin/pg_config \
+  --no-default-features \
+  --features pg17
+git diff --check
+```
+
+Runtime validation must use a real PostgreSQL instance with the extension preloaded. Compilation
+alone does not exercise authentication hooks, the worker, restart recovery or standby promotion.
+
+## License
+
+See [LICENSE](LICENSE).

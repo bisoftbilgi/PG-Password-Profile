@@ -24,8 +24,7 @@ pg_test = []
 pgrx = "=0.16.1"
 bcrypt = "0.15"
 md5 = "0.7"  # Legacy support for backward compatibility
-rand = "0.8"  # For timing attack prevention
-siphasher = "1.0"  # For consistent blacklist hashing with fixed keys
+siphasher = "1.0"  # Deterministic per-user advisory-lock keys (fixed seeds)
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"

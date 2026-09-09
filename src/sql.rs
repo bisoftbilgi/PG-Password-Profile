@@ -10,6 +10,10 @@ pub(crate) fn int4_arg(value: i32) -> DatumWithOid<'static> {
     unsafe { DatumWithOid::new(value, pg_sys::INT4OID) }
 }
 
+pub(crate) fn bytea_arg<'a>(value: &'a [u8]) -> DatumWithOid<'a> {
+    unsafe { DatumWithOid::new(value, pg_sys::BYTEAOID) }
+}
+
 pub(crate) fn spi_update<'a>(
     client: &mut SpiClient<'_>,
     query: &str,
