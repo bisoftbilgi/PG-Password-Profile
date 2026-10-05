@@ -136,6 +136,10 @@ sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 \
   -c "SELECT password_profile.load_blacklist_from_file('/var/lib/pgsql/17/data/password_profile_blacklist.txt');"
 ```
 
+`CREATE EXTENSION` requires the library to have been preloaded at server start. Otherwise it
+fails with SQLSTATE `55000` and rolls back the installation. Changing `shared_preload_libraries`
+and reloading is not enough; restart PostgreSQL before retrying.
+
 Enable the features and reload:
 
 ```conf
@@ -249,6 +253,7 @@ PostgreSQL's password authentication.
 ## Monitoring
 
 ```sql
+SELECT password_profile.password_profile_status();
 SELECT * FROM password_profile.get_lock_cache_stats();
 
 SELECT username, fail_count, last_fail, lockout_until
@@ -260,6 +265,7 @@ Functions and tables are not granted to `PUBLIC`. A read-only monitoring role ne
 
 ```sql
 GRANT USAGE ON SCHEMA password_profile TO monitoring_role;
+GRANT EXECUTE ON FUNCTION password_profile.password_profile_status() TO monitoring_role;
 GRANT SELECT ON TABLE password_profile.login_attempts TO monitoring_role;
 GRANT EXECUTE ON FUNCTION password_profile.get_lock_cache_stats() TO monitoring_role;
 GRANT EXECUTE ON FUNCTION password_profile.is_user_locked(text) TO monitoring_role;
@@ -267,6 +273,12 @@ GRANT EXECUTE ON FUNCTION password_profile.is_user_locked(text) TO monitoring_ro
 
 Do not grant direct write access to extension tables. Use the management functions so shared caches
 remain consistent.
+
+Removing the preload entry and restarting leaves the SQL objects installed but disables policy
+enforcement. The status function reports `NOT ACTIVE`; `get_lock_cache_stats()` reports
+`library_preloaded = 0`. Loading the library through a function or `LOAD` cannot reactivate it.
+During `pg_upgrade` binary-upgrade mode, policy hooks and the worker remain disabled so PostgreSQL
+can restore roles, databases and extension members. Normal startup with preload activates them again.
 
 ## Standby behavior
 

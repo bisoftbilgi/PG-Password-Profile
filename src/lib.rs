@@ -28,7 +28,37 @@ use crate::sql::{int4_arg, text_arg};
 pub use worker::auth_event_consumer_main;
 
 ::pgrx::pg_module_magic!();
+pgrx::extension_sql_file!(
+    "../sql/preload_required.sql",
+    name = "preload_required",
+    bootstrap
+);
 pgrx::extension_sql_file!("../sql/password_profile_schema.sql");
+
+// Backends inherit this from the postmaster. A later LOAD or SQL function call
+// must never turn an unloaded server into one that claims to enforce policy.
+static PRELOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn preloaded() -> bool {
+    PRELOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Defined by the bootstrap SQL, so its call precedes every policy object.
+#[pg_extern(sql = false)]
+fn password_profile_require_preload() {
+    // pg_upgrade restores extension members individually, outside the normal
+    // installation script. Allow its library checks and restore sessions while
+    // _PG_init keeps hooks and workers disabled in binary-upgrade mode.
+    if unsafe { pg_sys::IsBinaryUpgrade } || preloaded() {
+        return;
+    }
+    pgrx::ereport!(
+        ERROR,
+        PgSqlErrorCode::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+        "password_profile must be loaded through shared_preload_libraries",
+        "Add password_profile to shared_preload_libraries, restart PostgreSQL, and retry CREATE EXTENSION password_profile. A configuration reload is not sufficient."
+    );
+}
 
 // Privileges for everything this extension creates.
 //
@@ -58,6 +88,7 @@ REVOKE ALL ON FUNCTION @extschema@.check_user_access(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION @extschema@.clear_login_attempts(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION @extschema@.get_lock_cache_stats() FROM PUBLIC;
 REVOKE ALL ON FUNCTION @extschema@.get_password_stats(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION @extschema@.password_profile_status() FROM PUBLIC;
 REVOKE ALL ON FUNCTION @extschema@.init_login_attempts_table() FROM PUBLIC;
 REVOKE ALL ON FUNCTION @extschema@.is_user_locked(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION @extschema@.load_blacklist_from_file(text) FROM PUBLIC;
@@ -880,7 +911,23 @@ fn register_client_auth_hook() {
 
 #[no_mangle]
 pub unsafe extern "C-unwind" fn _PG_init() {
-    pgrx::warning!("password_profile_pure: _PG_init called - extension loading");
+    if !pg_sys::process_shared_preload_libraries_in_progress {
+        if pg_sys::IsUnderPostmaster && !pg_sys::IsBinaryUpgrade {
+            pgrx::warning!(
+                "password_profile NOT ACTIVE: the library was not loaded through shared_preload_libraries; password policy, expiry and brute-force protection are not enforced. Add password_profile to shared_preload_libraries and restart PostgreSQL."
+            );
+        }
+        return;
+    }
+    PRELOADED.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // pg_upgrade starts servers with -b and restores roles/databases and
+    // extension members. Do not enforce password policy or keep the control
+    // database occupied with a worker during that maintenance path.
+    if pg_sys::IsBinaryUpgrade {
+        pgrx::log!("password_profile: binary upgrade mode; hooks and worker are disabled");
+        return;
+    }
 
     static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
 
@@ -2635,6 +2682,18 @@ fn get_password_stats(username: &str) -> Result<String, Box<dyn std::error::Erro
 // Instrumentation & Monitoring Functions
 // ====================================================================================
 
+/// Reports actual library activation, not the configured value for next start.
+#[pg_extern]
+fn password_profile_status() -> String {
+    if unsafe { pg_sys::IsBinaryUpgrade } {
+        return "password_profile NOT ACTIVE: binary upgrade mode; policy hooks and worker are disabled".to_string();
+    }
+    if !preloaded() {
+        return "password_profile NOT ACTIVE: not loaded through shared_preload_libraries; password policy, expiry and brute-force protection are not enforced. Add password_profile to shared_preload_libraries and restart PostgreSQL.".to_string();
+    }
+    "password_profile preloaded: policy hooks installed; use get_lock_cache_stats() to check worker and cache readiness".to_string()
+}
+
 /// Returns runtime statistics about lock cache and authentication failures
 /// Useful for ops monitoring and capacity planning
 #[pg_extern]
@@ -2649,7 +2708,15 @@ fn get_lock_cache_stats() -> Result<
     >,
     Box<dyn std::error::Error>,
 > {
-    let stats = lock_cache::collect_stats()?;
+    let mut stats = lock_cache::collect_stats()?;
+    stats.insert(
+        0,
+        (
+            "library_preloaded".to_string(),
+            i64::from(preloaded()),
+            "1 if loaded through shared_preload_libraries at server start; 0 means password_profile policy hooks are inactive (restart required)".to_string(),
+        ),
+    );
     Ok(TableIterator::new(stats.into_iter()))
 }
 
